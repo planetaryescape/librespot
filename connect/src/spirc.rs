@@ -480,7 +480,6 @@ impl SpircTask {
                     connection_id_update,
                     match |connection_id| if let Err(why) = self.handle_connection_id_update(connection_id).await {
                         error!("failed handling connection id update: {why}");
-                        break;
                     }
                 },
                 // main dealer update of any remote device updates
@@ -588,11 +587,13 @@ impl SpircTask {
                         }
                     }
                 },
-                // dealer reconnected after a connection loss — our subscription
-                // streams are stale, so break out and let main.rs re-create spirc
+                // Dealer reconnected after a connection loss. Our subscription
+                // streams survive because they're registered on the shared
+                // DealerShared — the new websocket dispatches through the same
+                // handlers. A new connection_id will arrive via
+                // connection_id_update and re-register our device state.
                 Ok(()) = reconnect_rx.changed() => {
-                    warn!("Dealer reconnected; restarting spirc to refresh subscriptions.");
-                    break;
+                    info!("Dealer reconnected; awaiting new connection_id.");
                 },
                 else => break
             }
