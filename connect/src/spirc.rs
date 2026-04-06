@@ -511,6 +511,13 @@ impl SpircTask {
                     connection_id_update,
                     match |connection_id| if let Err(why) = self.handle_connection_id_update(connection_id).await {
                         error!("failed handling connection id update: {why}");
+                        if !self.connect_established {
+                            // Initial registration failed — can't process
+                            // commands without it, so restart spirc.
+                            break;
+                        }
+                        // Re-registration after dealer reconnect failed —
+                        // stay alive, next connection_id push will retry.
                     }
                 },
                 // main dealer update of any remote device updates
