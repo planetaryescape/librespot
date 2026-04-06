@@ -630,10 +630,10 @@ impl SpircTask {
             }
         }
 
-        if self.session.is_invalid() {
-            // Session TCP connection died — skip server communication that
-            // would fail anyway. The Player continues playing from its
-            // buffer independently; main.rs will create a new session.
+        if self.session.is_invalid() && !self.shutdown {
+            // Session TCP connection died unexpectedly — skip server
+            // communication that would fail anyway. The Player continues
+            // playing from its buffer; main.rs will create a new session.
             warn!(
                 "session lost, saving playback state for recovery: {:?}",
                 self.play_status
