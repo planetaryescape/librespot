@@ -2021,6 +2021,10 @@ async fn main() {
                         last_credentials = Some(credentials.clone());
                         auto_connect_times.clear();
 
+                        // New account via Discovery — discard any saved
+                        // playback state from the previous account.
+                        saved_playback_state = None;
+
                         if let Some(spirc) = spirc.take() {
                             if let Err(e) = spirc.shutdown() {
                                 error!("error sending spirc shutdown message: {e}");
