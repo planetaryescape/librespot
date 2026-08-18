@@ -1006,19 +1006,26 @@ impl SpircTask {
         // Own the id: the demote path below needs `&mut self`, which conflicts
         // with the `&str` borrow `device_id()` returns.
         let our_device_id = self.session.device_id().to_owned();
-        let foreign_active =
-            !cluster.active_device_id.is_empty() && cluster.active_device_id != our_device_id;
         let same_session = cluster.player_state.session_id == self.session.session_id()
             || cluster.player_state.session_id.is_empty();
 
-        if foreign_active {
-            // Another device owns playback now. If we came back up believing we
-            // were still playing (session dropped while handed off), demote
-            // ourselves instead of reclaiming the stream. This is the
-            // reconnect steal-guard: without it, a session drop that coincides
-            // with a hand-off (e.g. to a car) lets us silently grab playback
-            // back on reconnect.
-            if want_playing && is_reregistration {
+        // Pure decision (unit-tested in `reconnect_steal_guard_tests`): what to
+        // do now that we've seen the fresh cluster. Keeps the I/O below thin.
+        let action = decide_reconnect_action(
+            is_reregistration,
+            want_playing,
+            &cluster.active_device_id,
+            &our_device_id,
+            same_session,
+        );
+
+        match action {
+            ReconnectAction::StealGuardDemote => {
+                // Another device owns playback and we came back up believing we
+                // were still playing (session dropped while handed off). Demote
+                // instead of reclaiming — without this, a session drop that
+                // coincides with a hand-off (e.g. to a car) lets us silently
+                // grab playback back on reconnect.
                 warn!(
                     "reconnect steal-guard: device <{}> is active (session <{}>), not us <{}>; \
                      going inactive instead of reclaiming playback (was {:?})",
@@ -1033,39 +1040,33 @@ impl SpircTask {
                 if let Err(why) = self.connect_state.became_inactive(&self.session).await {
                     error!("reconnect steal-guard: failed to go inactive: {why}");
                 }
-            } else {
+                return Ok(());
+            }
+            ReconnectAction::Defer => {
                 info!(
                     "active device is <{}> with session <{}>",
                     cluster.active_device_id, cluster.player_state.session_id
                 );
+                return Ok(());
             }
-            return Ok(());
-        }
-
-        if !same_session {
-            info!(
-                "active device is <{}> with session <{}>",
-                cluster.active_device_id, cluster.player_state.session_id
-            );
-            return Ok(());
-        }
-
-        // No competing active device. If we deferred our playback state on a
-        // reconnect (above), it is now safe to re-assert it and resume.
-        if want_playing && is_reregistration {
-            info!(
-                "reconnect: still the active device, restoring playback state: {:?}",
-                self.play_status
-            );
-            self.connect_state.set_status(&self.play_status);
-            if self.connect_state.is_playing() {
-                self.connect_state
-                    .update_position_in_relation(self.now_ms());
+            ReconnectAction::ReassertPlayback => {
+                // No competing active device. We withheld our playback state on
+                // this reconnect; now it's safe to re-assert it and resume.
+                info!(
+                    "reconnect: still the active device, restoring playback state: {:?}",
+                    self.play_status
+                );
+                self.connect_state.set_status(&self.play_status);
+                if self.connect_state.is_playing() {
+                    self.connect_state
+                        .update_position_in_relation(self.now_ms());
+                }
+                self.connect_state.set_now(self.now_ms() as u64);
+                if let Err(why) = self.notify().await {
+                    error!("reconnect: failed to re-assert playback state: {why}");
+                }
             }
-            self.connect_state.set_now(self.now_ms() as u64);
-            if let Err(why) = self.notify().await {
-                error!("reconnect: failed to re-assert playback state: {why}");
-            }
+            ReconnectAction::Proceed => {}
         }
 
         if cluster.transfer_data.is_empty() {
@@ -2083,5 +2084,158 @@ impl SpircTask {
 impl Drop for SpircTask {
     fn drop(&mut self) {
         debug!("drop Spirc[{}]", self.spirc_id);
+    }
+}
+
+/// The action [`SpircTask::handle_connection_id_update`] takes after seeing the
+/// fresh cluster on (re-)registration. Extracted as a pure function so the
+/// reconnect steal-guard is unit-testable without a live Spotify session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconnectAction {
+    /// Another device is the active player and we re-registered believing we
+    /// were still playing (the session dropped while playback was handed off,
+    /// e.g. to a car). Demote to inactive instead of reclaiming the stream.
+    StealGuardDemote,
+    /// Another device — or a different session — is active. Stand down quietly.
+    Defer,
+    /// No competing active device and we withheld our play status on this
+    /// reconnect; re-assert it and resume.
+    ReassertPlayback,
+    /// No competing active device; continue to the transfer-takeover check.
+    Proceed,
+}
+
+/// Decide what to do on (re-)registration after the cluster response.
+///
+/// - `is_reregistration`: we had already established a connect session before
+///   this connection-id (i.e. this is a reconnect, not our first appearance).
+/// - `want_playing`: our local play status is non-`Stopped`.
+///
+/// Preserves librespot's original behavior for every case except the two the
+/// steal-guard introduces: [`ReconnectAction::StealGuardDemote`] (was a silent
+/// reclaim) and [`ReconnectAction::ReassertPlayback`] (pairs with withholding
+/// our play status on a reconnect until the cluster confirms we're active).
+fn decide_reconnect_action(
+    is_reregistration: bool,
+    want_playing: bool,
+    active_device_id: &str,
+    our_device_id: &str,
+    same_session: bool,
+) -> ReconnectAction {
+    let has_active = !active_device_id.is_empty();
+    let foreign_active = has_active && active_device_id != our_device_id;
+
+    if foreign_active {
+        if is_reregistration && want_playing {
+            return ReconnectAction::StealGuardDemote;
+        }
+        return ReconnectAction::Defer;
+    }
+
+    // From here the active device is empty or is us.
+    if is_reregistration && want_playing && same_session {
+        return ReconnectAction::ReassertPlayback;
+    }
+
+    // Original librespot deferred (returned early) whenever the cluster named an
+    // active device or reported a different session; only "no active device and
+    // same session" fell through to the transfer-takeover check.
+    let we_are_cluster_active = has_active; // foreign_active already ruled out
+    if we_are_cluster_active || !same_session {
+        return ReconnectAction::Defer;
+    }
+    ReconnectAction::Proceed
+}
+
+#[cfg(test)]
+mod reconnect_steal_guard_tests {
+    use super::{decide_reconnect_action, ReconnectAction};
+
+    const US: &str = "our-device-id";
+    const CAR: &str = "car-device-id";
+
+    // The bug this guards: session drops while playback is handed off to the
+    // car; on reconnect we still believe we're playing and must NOT reclaim.
+    #[test]
+    fn reconnect_while_playing_with_foreign_active_demotes() {
+        assert_eq!(
+            decide_reconnect_action(true, true, CAR, US, true),
+            ReconnectAction::StealGuardDemote
+        );
+        // Same even if the cluster reports a different session id.
+        assert_eq!(
+            decide_reconnect_action(true, true, CAR, US, false),
+            ReconnectAction::StealGuardDemote
+        );
+    }
+
+    #[test]
+    fn reconnect_still_active_reasserts_playback() {
+        // Cluster says we're the active device.
+        assert_eq!(
+            decide_reconnect_action(true, true, US, US, true),
+            ReconnectAction::ReassertPlayback
+        );
+        // Cluster names no active device but same session — still ours to resume.
+        assert_eq!(
+            decide_reconnect_action(true, true, "", US, true),
+            ReconnectAction::ReassertPlayback
+        );
+    }
+
+    #[test]
+    fn reconnect_not_playing_never_demotes_or_reasserts() {
+        // Nothing to steal back if we weren't playing — just defer to the car.
+        assert_eq!(
+            decide_reconnect_action(true, false, CAR, US, true),
+            ReconnectAction::Defer
+        );
+    }
+
+    #[test]
+    fn first_registration_never_triggers_steal_guard() {
+        // A foreign active device on our very first appearance is a plain defer,
+        // not a demote — there is no withheld state to protect.
+        assert_eq!(
+            decide_reconnect_action(false, true, CAR, US, true),
+            ReconnectAction::Defer
+        );
+    }
+
+    #[test]
+    fn no_active_device_same_session_proceeds_to_takeover_check() {
+        // Original fall-through case: empty active id + same session.
+        assert_eq!(
+            decide_reconnect_action(false, false, "", US, true),
+            ReconnectAction::Proceed
+        );
+        assert_eq!(
+            decide_reconnect_action(true, false, "", US, true),
+            ReconnectAction::Proceed
+        );
+    }
+
+    #[test]
+    fn empty_active_but_foreign_session_defers() {
+        // No named active device but a different session → original returned.
+        assert_eq!(
+            decide_reconnect_action(false, false, "", US, false),
+            ReconnectAction::Defer
+        );
+    }
+
+    #[test]
+    fn we_are_cluster_active_but_not_reasserting_defers() {
+        // Cluster says we're active, but we're not a playing re-registration →
+        // match original early-return rather than proceeding to takeover.
+        assert_eq!(
+            decide_reconnect_action(false, false, US, US, true),
+            ReconnectAction::Defer
+        );
+        // Playing but a different session → don't reassert into a foreign session.
+        assert_eq!(
+            decide_reconnect_action(true, true, US, US, false),
+            ReconnectAction::Defer
+        );
     }
 }
