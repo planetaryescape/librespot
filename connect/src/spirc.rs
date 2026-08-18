@@ -953,20 +953,34 @@ impl SpircTask {
         trace!("Received connection ID update: {connection_id:?}");
         self.session.set_connection_id(&connection_id);
 
-        // If we have active playback (e.g. restored from saved state),
-        // update the position before registering so Spotify sees the
-        // correct track position.
-        if !matches!(self.play_status, SpircPlayStatus::Stopped) {
-            info!(
-                "re-registering with active playback state: {:?}",
-                self.play_status
-            );
+        // Whether this is a RE-registration (dealer/session reconnect) rather
+        // than our first appearance. `connect_established` is still false here
+        // on the very first connection_id and gets set true below. On a
+        // reconnect another device may have become the active player while our
+        // dealer was down — the classic case is playback being handed off to a
+        // car head unit during the drop window. We must NOT pre-announce
+        // ourselves as playing before we've seen the fresh cluster, or the
+        // `put_connect_state` below tells Spotify to hand the stream back to us
+        // and yanks it from the device the user is actually listening on.
+        let is_reregistration = self.connect_established;
+        let want_playing = !matches!(self.play_status, SpircPlayStatus::Stopped);
+
+        // First registration: safe to restore our playback state up front —
+        // there is no competing active device yet. On a reconnect we defer this
+        // until the cluster confirms we're still the active device (below).
+        if want_playing && !is_reregistration {
+            info!("registering with active playback state: {:?}", self.play_status);
             self.connect_state.set_status(&self.play_status);
             if self.connect_state.is_playing() {
                 self.connect_state
                     .update_position_in_relation(self.now_ms());
             }
             self.connect_state.set_now(self.now_ms() as u64);
+        } else if want_playing {
+            debug!(
+                "re-registering after reconnect; withholding play status {:?} until the cluster confirms we're still active",
+                self.play_status
+            );
         }
 
         let cluster = match self
@@ -989,23 +1003,80 @@ impl SpircTask {
 
         self.connect_established = true;
 
+        // Own the id: the demote path below needs `&mut self`, which conflicts
+        // with the `&str` borrow `device_id()` returns.
+        let our_device_id = self.session.device_id().to_owned();
+        let foreign_active =
+            !cluster.active_device_id.is_empty() && cluster.active_device_id != our_device_id;
         let same_session = cluster.player_state.session_id == self.session.session_id()
             || cluster.player_state.session_id.is_empty();
-        if !cluster.active_device_id.is_empty() || !same_session {
+
+        if foreign_active {
+            // Another device owns playback now. If we came back up believing we
+            // were still playing (session dropped while handed off), demote
+            // ourselves instead of reclaiming the stream. This is the
+            // reconnect steal-guard: without it, a session drop that coincides
+            // with a hand-off (e.g. to a car) lets us silently grab playback
+            // back on reconnect.
+            if want_playing && is_reregistration {
+                warn!(
+                    "reconnect steal-guard: device <{}> is active (session <{}>), not us <{}>; \
+                     going inactive instead of reclaiming playback (was {:?})",
+                    cluster.active_device_id,
+                    cluster.player_state.session_id,
+                    our_device_id,
+                    self.play_status
+                );
+                self.play_status = SpircPlayStatus::Stopped;
+                self.handle_stop();
+                self.connect_state.set_active(false);
+                if let Err(why) = self.connect_state.became_inactive(&self.session).await {
+                    error!("reconnect steal-guard: failed to go inactive: {why}");
+                }
+            } else {
+                info!(
+                    "active device is <{}> with session <{}>",
+                    cluster.active_device_id, cluster.player_state.session_id
+                );
+            }
+            return Ok(());
+        }
+
+        if !same_session {
             info!(
                 "active device is <{}> with session <{}>",
                 cluster.active_device_id, cluster.player_state.session_id
             );
             return Ok(());
-        } else if cluster.transfer_data.is_empty() {
+        }
+
+        // No competing active device. If we deferred our playback state on a
+        // reconnect (above), it is now safe to re-assert it and resume.
+        if want_playing && is_reregistration {
+            info!(
+                "reconnect: still the active device, restoring playback state: {:?}",
+                self.play_status
+            );
+            self.connect_state.set_status(&self.play_status);
+            if self.connect_state.is_playing() {
+                self.connect_state
+                    .update_position_in_relation(self.now_ms());
+            }
+            self.connect_state.set_now(self.now_ms() as u64);
+            if let Err(why) = self.notify().await {
+                error!("reconnect: failed to re-assert playback state: {why}");
+            }
+        }
+
+        if cluster.transfer_data.is_empty() {
             debug!("got empty transfer state, do nothing");
             return Ok(());
-        } else {
-            info!(
-                "trying to take over control automatically, session_id: {}",
-                cluster.player_state.session_id
-            )
         }
+
+        info!(
+            "trying to take over control automatically, session_id: {}",
+            cluster.player_state.session_id
+        );
 
         use protobuf::Message;
 
